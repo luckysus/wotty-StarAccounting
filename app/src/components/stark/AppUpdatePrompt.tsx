@@ -12,21 +12,33 @@ type DownloadState = {
   status: "idle" | "downloading" | "permission" | "ready" | "error";
   percent: number | null;
   downloadedBytes: number;
+  totalBytes: number;
+  bytesPerSecond: number;
   message: string | null;
 };
 type NativeDownloadProgress = {
   stage: "downloading" | "permission";
   percent?: number;
   downloadedBytes: number;
+  totalBytes: number;
+  bytesPerSecond: number;
 };
 type NativeAppUpdate = {
+  getInstalledVersion(): Promise<{ versionCode: number; versionName: string }>;
   downloadAndInstall(options: { url: string; versionCode: number }): Promise<{ installationStarted: boolean }>;
   openDownloadInBrowser(options: { url: string }): Promise<{ opened: boolean }>;
   addListener(eventName: "downloadProgress", listener: (progress: NativeDownloadProgress) => void): Promise<PluginListenerHandle>;
 };
 
 const nativeAppUpdate = registerPlugin<NativeAppUpdate>("AppUpdate");
-const initialDownload: DownloadState = { status: "idle", percent: null, downloadedBytes: 0, message: null };
+const initialDownload: DownloadState = {
+  status: "idle",
+  percent: null,
+  downloadedBytes: 0,
+  totalBytes: 0,
+  bytesPerSecond: 0,
+  message: null,
+};
 const CHECK_TIMEOUT_MS = 30_000;
 
 function isAppVersionInfo(value: unknown): value is AppVersionInfo {
@@ -44,11 +56,18 @@ function parseChangelogItems(changelog: string | null | undefined) {
     .filter(Boolean);
 }
 
+function formatDownloadSpeed(bytesPerSecond: number) {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return null;
+  if (bytesPerSecond >= 1024 * 1024) return `${(bytesPerSecond / 1024 / 1024).toFixed(1)} MB/s`;
+  return `${Math.max(1, Math.round(bytesPerSecond / 1024))} KB/s`;
+}
+
 export function AppUpdatePrompt() {
   const [update, setUpdate] = useState<UpdateState>(null);
   const [notice, setNotice] = useState<NoticeState>(null);
   const [checking, setChecking] = useState(false);
   const [download, setDownload] = useState<DownloadState>(initialDownload);
+  const [installedVersionName, setInstalledVersionName] = useState(CURRENT_APP_VERSION_NAME);
   const downloadRunningRef = useRef(false);
   const checkAbortRef = useRef<AbortController | null>(null);
   const checkRequestIdRef = useRef(0);
@@ -113,6 +132,11 @@ export function AppUpdatePrompt() {
         setChecking(true);
       }
       try {
+        const installed = await nativeAppUpdate.getInstalledVersion();
+        if (!Number.isSafeInteger(installed.versionCode) || installed.versionCode < 1 || !installed.versionName) {
+          throw new Error("Invalid installed app version");
+        }
+        if (!cancelled && requestId === checkRequestIdRef.current) setInstalledVersionName(installed.versionName);
         const response = await fetch(APP_UPDATE_URL, { signal: controller.signal, cache: "no-store" });
         if (cancelled || requestId !== checkRequestIdRef.current) return;
         if (!response.ok) {
@@ -130,7 +154,7 @@ export function AppUpdatePrompt() {
           ? { ...responseInfo, apkUrl: null }
           : responseInfo;
         if (cancelled || requestId !== checkRequestIdRef.current) return;
-        const hasUpdate = hasNewerAppVersion(CURRENT_APP_VERSION_CODE, info);
+        const hasUpdate = hasNewerAppVersion(installed.versionCode, info);
         setAppUpdateAvailable(hasUpdate);
         if (hasUpdate) {
           if (manual || !isKtHybrid) {
@@ -138,7 +162,7 @@ export function AppUpdatePrompt() {
             setUpdate({ info, unavailable: !info.apkUrl });
           }
         } else if (manual) {
-          setNotice({ title: "已是最新版本", message: "当前 App 版本为 " + CURRENT_APP_VERSION_NAME + "。" });
+          setNotice({ title: "已是最新版本", message: "当前 App 版本为 " + installed.versionName + "。" });
         }
       } catch {
         if (cancelled || requestId !== checkRequestIdRef.current || silentCheckAbortRef.current.has(controller)) return;
@@ -204,7 +228,7 @@ export function AppUpdatePrompt() {
   async function openDownload() {
     if (!info.apkUrl || downloadRunningRef.current) return;
     downloadRunningRef.current = true;
-    setDownload({ status: "downloading", percent: null, downloadedBytes: 0, message: null });
+    setDownload({ ...initialDownload, status: "downloading" });
     let listener: PluginListenerHandle | null = null;
     try {
       listener = await nativeAppUpdate.addListener("downloadProgress", (progress) => {
@@ -212,16 +236,20 @@ export function AppUpdatePrompt() {
           status: progress.stage === "permission" ? "permission" : "downloading",
           percent: typeof progress.percent === "number" ? progress.percent : null,
           downloadedBytes: progress.downloadedBytes,
+          totalBytes: progress.totalBytes,
+          bytesPerSecond: progress.bytesPerSecond,
           message: null,
         });
       });
       await nativeAppUpdate.downloadAndInstall({ url: info.apkUrl, versionCode: info.versionCode });
-      setDownload({ status: "ready", percent: 100, downloadedBytes: 0, message: null });
+      setDownload({ ...initialDownload, status: "ready", percent: 100 });
     } catch (error) {
       setDownload({
         status: "error",
         percent: null,
         downloadedBytes: 0,
+        totalBytes: 0,
+        bytesPerSecond: 0,
         message: error instanceof Error ? error.message : "下载或安装准备失败，请重试。",
       });
     } finally {
@@ -246,11 +274,13 @@ export function AppUpdatePrompt() {
     }
   }
 
+  const speedLabel = formatDownloadSpeed(download.bytesPerSecond);
+  const downloadedLabel = download.totalBytes > 0
+    ? `${(download.downloadedBytes / 1024 / 1024).toFixed(1)} / ${(download.totalBytes / 1024 / 1024).toFixed(1)} MB`
+    : `${(download.downloadedBytes / 1024 / 1024).toFixed(1)} MB`;
   const progressLabel = download.status === "permission"
     ? "请允许星会计安装应用，返回后会继续打开安装界面。"
-    : download.percent === null
-      ? `已下载 ${(download.downloadedBytes / 1024 / 1024).toFixed(1)} MB`
-      : `已下载 ${download.percent}%`;
+    : `已下载 ${download.percent === null ? downloadedLabel : `${download.percent}% · ${downloadedLabel}`}${speedLabel ? ` · ${speedLabel}` : ""}`;
   const actionLabel = download.status === "downloading" ? "正在下载…"
     : download.status === "permission" ? "等待安装授权…"
       : download.status === "ready" ? "重新打开安装"
@@ -262,7 +292,7 @@ export function AppUpdatePrompt() {
         <div className="app-update-icon" aria-hidden="true">↗</div>
         <p className="app-update-kicker">发现新版本</p>
         <h2 id="app-update-title">星会计 {info.versionName}</h2>
-        <p className="app-update-copy">当前版本 {CURRENT_APP_VERSION_NAME}，有新的 App 版本可用。</p>
+        <p className="app-update-copy">当前版本 {installedVersionName}，有新的 App 版本可用。</p>
         {changelogItems.length > 0 ? (
           <ul className="app-update-changelog" aria-label="更新内容">
             {changelogItems.map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}

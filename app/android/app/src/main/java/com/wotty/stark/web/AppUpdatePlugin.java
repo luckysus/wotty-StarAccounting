@@ -1,10 +1,15 @@
 package com.wotty.stark.web;
 
+import android.app.DownloadManager;
 import android.content.ClipData;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageInfo;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Environment;
+import android.os.SystemClock;
 import android.provider.Settings;
 
 import androidx.activity.result.ActivityResult;
@@ -18,27 +23,35 @@ import com.getcapacitor.annotation.ActivityCallback;
 import com.getcapacitor.annotation.CapacitorPlugin;
 
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.net.ConnectException;
-import java.net.HttpURLConnection;
-import java.net.SocketTimeoutException;
 import java.net.URL;
-import java.net.UnknownHostException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 @CapacitorPlugin(name = "AppUpdate")
 public class AppUpdatePlugin extends Plugin {
     private static final long MAX_APK_BYTES = 500L * 1024 * 1024;
     private static final String PROGRESS_EVENT = "downloadProgress";
-    private static final int CONNECT_TIMEOUT_MS = 45_000;
-    private static final int READ_TIMEOUT_MS = 120_000;
-    private static final int MAX_DOWNLOAD_ATTEMPTS = 2;
+    private static final long DOWNLOAD_POLL_INTERVAL_MS = 250;
+    private static final long DOWNLOAD_STALL_TIMEOUT_MS = 120_000;
+    private static final long DOWNLOAD_TOTAL_TIMEOUT_MS = 15 * 60_000;
 
     private final AtomicBoolean downloading = new AtomicBoolean(false);
     private volatile File downloadedFile;
     private volatile String downloadedUrl;
+
+    @PluginMethod
+    public void getInstalledVersion(PluginCall call) {
+        try {
+            PackageInfo installed = getContext().getPackageManager()
+                    .getPackageInfo(getContext().getPackageName(), 0);
+            JSObject result = new JSObject();
+            result.put("versionCode", versionCode(installed));
+            result.put("versionName", installed.versionName);
+            call.resolve(result);
+        } catch (Exception error) {
+            call.reject("无法读取当前安装版本，请稍后重试。");
+        }
+    }
 
     @PluginMethod
     public void downloadAndInstall(PluginCall call) {
@@ -51,8 +64,14 @@ public class AppUpdatePlugin extends Plugin {
 
         try {
             requireHttps(new URL(source));
+            PackageInfo installed = getContext().getPackageManager()
+                    .getPackageInfo(getContext().getPackageName(), 0);
+            if (expectedVersionCode <= versionCode(installed)) {
+                call.reject("当前已是此版本或更新版本，无需重复下载。");
+                return;
+            }
         } catch (Exception ignored) {
-            call.reject("更新地址必须是有效的 HTTPS 链接。");
+            call.reject("更新地址或当前安装版本无效，请重新检查更新。");
             return;
         }
 
@@ -68,7 +87,7 @@ public class AppUpdatePlugin extends Plugin {
                         !isValidApk(apk, expectedVersionCode)) {
                     downloadedFile = null;
                     downloadedUrl = null;
-                    apk = downloadApk(source);
+                    apk = downloadApk(source, expectedVersionCode);
                     if (!isValidApk(apk, expectedVersionCode)) {
                         apk.delete();
                         throw new IOException("安装包与当前星会计版本不匹配，请重新检查更新。");
@@ -106,126 +125,137 @@ public class AppUpdatePlugin extends Plugin {
         }
     }
 
-    private File downloadApk(String source) throws IOException {
-        IOException lastError = null;
-        for (int attempt = 1; attempt <= MAX_DOWNLOAD_ATTEMPTS; attempt++) {
-            try {
-                return downloadApkOnce(source);
-            } catch (IOException error) {
-                lastError = error;
-                if (attempt == MAX_DOWNLOAD_ATTEMPTS || !isRetryableDownloadError(error)) {
-                    throw readableDownloadError(error);
-                }
-            }
+    private File downloadApk(String source, int expectedVersionCode) throws IOException {
+        File externalDownloads = getContext().getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+        if (externalDownloads == null) {
+            throw new IOException("无法访问系统下载目录，请检查存储空间后重试。");
         }
-        throw readableDownloadError(lastError);
-    }
-
-    private File downloadApkOnce(String source) throws IOException {
-        File directory = new File(getContext().getCacheDir(), "app-updates");
+        File directory = new File(externalDownloads, "app-updates");
         if (!directory.isDirectory() && !directory.mkdirs()) {
             throw new IOException("无法创建安装包缓存目录。");
         }
-        File target = new File(directory, "star-accounting-update.apk");
-        File temporary = new File(directory, "star-accounting-update.apk.part");
-        if (temporary.exists() && !temporary.delete()) {
-            throw new IOException("无法清理上次未完成的下载。");
-        }
-
-        HttpURLConnection connection = openHttpsConnection(source);
-        boolean completed = false;
-        try {
-            long total = connection.getContentLength();
-            if (total > MAX_APK_BYTES) throw new IOException("安装包过大，已停止下载。");
-
-            long received = 0;
-            long lastReportTime = 0;
-            byte[] buffer = new byte[64 * 1024];
-            reportProgress("downloading", 0, total);
-            try (InputStream input = connection.getInputStream();
-                 FileOutputStream output = new FileOutputStream(temporary)) {
-                int count;
-                while ((count = input.read(buffer)) != -1) {
-                    received += count;
-                    if (received > MAX_APK_BYTES) throw new IOException("安装包过大，已停止下载。");
-                    output.write(buffer, 0, count);
-                    long now = System.currentTimeMillis();
-                    if (now - lastReportTime >= 250) {
-                        reportProgress("downloading", received, total);
-                        lastReportTime = now;
-                    }
-                }
-            }
-
-            if (received == 0 || (total > 0 && received != total)) {
-                throw new IOException("安装包下载不完整，请重试。");
-            }
-            if (target.exists() && !target.delete()) throw new IOException("无法替换旧安装包缓存。");
-            if (!temporary.renameTo(target)) throw new IOException("无法保存已下载的安装包。");
-            completed = true;
-            reportProgress("downloading", received, received);
+        File target = new File(directory, "star-accounting-update-" + expectedVersionCode + ".apk");
+        if (target.isFile() && isValidApk(target, expectedVersionCode)) {
+            reportProgress("downloading", target.length(), target.length(), 0);
             return target;
-        } finally {
-            connection.disconnect();
-            if (!completed) temporary.delete();
         }
+        if (target.exists() && !target.delete()) throw new IOException("无法清理上次未完成的下载。");
+
+        DownloadManager manager = (DownloadManager) getContext().getSystemService(Context.DOWNLOAD_SERVICE);
+        if (manager == null) throw new IOException("系统下载服务不可用，请点击下方“下载更新”改用浏览器下载。");
+
+        DownloadManager.Request request = new DownloadManager.Request(Uri.parse(source));
+        request.setAllowedOverMetered(true);
+        request.setAllowedOverRoaming(false);
+        request.setMimeType("application/vnd.android.package-archive");
+        request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE);
+        request.setTitle("星会计更新");
+        request.setDescription("正在下载安装包");
+        request.addRequestHeader("Accept", "application/vnd.android.package-archive, application/octet-stream");
+        request.setDestinationUri(Uri.fromFile(target));
+
+        final long downloadId;
+        try {
+            downloadId = manager.enqueue(request);
+        } catch (Exception error) {
+            throw new IOException("无法启动系统下载，请点击下方“下载更新”改用浏览器下载。", error);
+        }
+        return awaitSystemDownload(manager, downloadId, target);
     }
 
-    private HttpURLConnection openHttpsConnection(String source) throws IOException {
-        URL current = requireHttps(new URL(source));
-        for (int redirects = 0; redirects <= 5; redirects++) {
-            HttpURLConnection connection = (HttpURLConnection) current.openConnection();
-            connection.setInstanceFollowRedirects(false);
-            connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
-            connection.setReadTimeout(READ_TIMEOUT_MS);
-            connection.setUseCaches(false);
-            connection.setRequestProperty("Accept", "application/vnd.android.package-archive, application/octet-stream");
-            connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) AppleWebKit/537.36 Mobile Safari/537.36 StarAccounting-App");
-            try {
-                int status = connection.getResponseCode();
-                if (status == HttpURLConnection.HTTP_OK) return connection;
-                if (status == HttpURLConnection.HTTP_MOVED_PERM ||
-                        status == HttpURLConnection.HTTP_MOVED_TEMP ||
-                        status == HttpURLConnection.HTTP_SEE_OTHER ||
-                        status == 307 || status == 308) {
-                    String location = connection.getHeaderField("Location");
-                    if (location == null) throw new IOException("安装包下载地址无效。");
-                    current = requireHttps(new URL(current, location));
-                    connection.disconnect();
-                    continue;
+    private File awaitSystemDownload(DownloadManager manager, long downloadId, File target) throws IOException {
+        long startedAt = SystemClock.elapsedRealtime();
+        long lastProgressAt = startedAt;
+        long lastReportAt = startedAt;
+        long lastReportedBytes = 0;
+        long previousBytes = -1;
+        reportProgress("downloading", 0, 0, 0);
+
+        while (true) {
+            long received;
+            long total;
+            int status;
+            int reason;
+            try (Cursor cursor = manager.query(new DownloadManager.Query().setFilterById(downloadId))) {
+                if (cursor == null || !cursor.moveToFirst()) {
+                    cancelSystemDownload(manager, downloadId, target);
+                    throw new IOException("系统下载任务已丢失，请重新下载。");
                 }
-                throw new IOException("服务器暂时无法提供安装包（HTTP " + status + "）。");
-            } catch (IOException error) {
-                connection.disconnect();
-                throw error;
+                status = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS));
+                reason = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON));
+                received = Math.max(0, cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)));
+                total = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES));
+            }
+
+            if (received > MAX_APK_BYTES || total > MAX_APK_BYTES) {
+                cancelSystemDownload(manager, downloadId, target);
+                throw new IOException("安装包过大，已停止下载。");
+            }
+
+            long now = SystemClock.elapsedRealtime();
+            if (received != previousBytes) {
+                previousBytes = received;
+                lastProgressAt = now;
+            }
+            if (now - lastReportAt >= DOWNLOAD_POLL_INTERVAL_MS || status == DownloadManager.STATUS_SUCCESSFUL) {
+                long elapsed = Math.max(1, now - lastReportAt);
+                long bytesPerSecond = Math.max(0, (received - lastReportedBytes) * 1000 / elapsed);
+                reportProgress("downloading", received, total, bytesPerSecond);
+                lastReportAt = now;
+                lastReportedBytes = received;
+            }
+
+            if (status == DownloadManager.STATUS_SUCCESSFUL) {
+                if (!target.isFile() || target.length() == 0 || (total > 0 && target.length() != total)) {
+                    cancelSystemDownload(manager, downloadId, target);
+                    throw new IOException("安装包下载不完整，请重试。");
+                }
+                reportProgress("downloading", target.length(), target.length(), 0);
+                return target;
+            }
+            if (status == DownloadManager.STATUS_FAILED) {
+                cancelSystemDownload(manager, downloadId, target);
+                throw systemDownloadError(reason);
+            }
+            if (now - startedAt >= DOWNLOAD_TOTAL_TIMEOUT_MS || now - lastProgressAt >= DOWNLOAD_STALL_TIMEOUT_MS) {
+                cancelSystemDownload(manager, downloadId, target);
+                throw new IOException("下载长时间没有进展，请点击下方“下载更新”改用浏览器下载。");
+            }
+
+            try {
+                Thread.sleep(DOWNLOAD_POLL_INTERVAL_MS);
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                cancelSystemDownload(manager, downloadId, target);
+                throw new IOException("下载已中断，请重新下载。", error);
             }
         }
-        throw new IOException("安装包下载地址跳转次数过多。");
     }
 
-    private boolean isRetryableDownloadError(IOException error) {
-        Throwable cause = error;
-        while (cause != null) {
-            if (cause instanceof SocketTimeoutException || cause instanceof ConnectException ||
-                    cause instanceof UnknownHostException) return true;
-            cause = cause.getCause();
+    private void cancelSystemDownload(DownloadManager manager, long downloadId, File target) {
+        try {
+            manager.remove(downloadId);
+        } catch (Exception ignored) {
+            // Best-effort cleanup; the app-owned file is removed below as well.
         }
-        return false;
+        if (target.exists()) target.delete();
     }
 
-    private IOException readableDownloadError(IOException error) {
-        if (error == null) return new IOException("下载失败，请稍后重试。");
-        Throwable cause = error;
-        while (cause != null) {
-            if (cause instanceof SocketTimeoutException) {
-                return new IOException("下载连接超时，请点击下方“下载更新”改用浏览器下载。", error);
-            }
-            if (cause instanceof ConnectException || cause instanceof UnknownHostException) {
-                return new IOException("无法连接下载服务器，请检查网络后重试。", error);
-            }
-            cause = cause.getCause();
+    private IOException systemDownloadError(int reason) {
+        if (reason == DownloadManager.ERROR_INSUFFICIENT_SPACE) {
+            return new IOException("手机存储空间不足，无法下载更新。");
         }
-        return error;
+        if (reason == DownloadManager.ERROR_DEVICE_NOT_FOUND) {
+            return new IOException("无法访问手机存储，请检查存储状态后重试。");
+        }
+        if (reason == DownloadManager.ERROR_CANNOT_RESUME) {
+            return new IOException("下载连接已中断且无法续传，请重新下载。");
+        }
+        if (reason == DownloadManager.ERROR_HTTP_DATA_ERROR ||
+                reason == DownloadManager.ERROR_UNHANDLED_HTTP_CODE) {
+            return new IOException("下载服务器响应异常，请点击下方“下载更新”改用浏览器下载。");
+        }
+        return new IOException("系统下载失败（错误 " + reason + "），请重试或改用浏览器下载。");
     }
 
     private URL requireHttps(URL url) throws IOException {
@@ -261,7 +291,7 @@ public class AppUpdatePlugin extends Plugin {
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
                 !getContext().getPackageManager().canRequestPackageInstalls()) {
-            reportProgress("permission", apk.length(), apk.length());
+            reportProgress("permission", apk.length(), apk.length(), 0);
             Intent settings = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
                     Uri.parse("package:" + getContext().getPackageName()));
             try {
@@ -303,11 +333,12 @@ public class AppUpdatePlugin extends Plugin {
         openInstaller(call, apk);
     }
 
-    private void reportProgress(String stage, long received, long total) {
+    private void reportProgress(String stage, long received, long total, long bytesPerSecond) {
         JSObject progress = new JSObject();
         progress.put("stage", stage);
         progress.put("downloadedBytes", received);
         progress.put("totalBytes", total > 0 ? total : 0);
+        progress.put("bytesPerSecond", Math.max(0, bytesPerSecond));
         if (total > 0) progress.put("percent", Math.min(100, (int) (received * 100 / total)));
         getActivity().runOnUiThread(() -> notifyListeners(PROGRESS_EVENT, progress));
     }
